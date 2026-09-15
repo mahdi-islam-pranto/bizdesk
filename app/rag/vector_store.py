@@ -108,7 +108,7 @@ def get_vectorstore():
     return _vectorstore
 
 
-
+# get the retriever object for the vector store
 def get_retriever():
     return get_vectorstore().as_retriever(search_kwargs={"k": settings.top_k})
 

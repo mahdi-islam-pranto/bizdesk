@@ -141,6 +141,7 @@ def chunk_qa_document(full_text: str, source: str) -> list[Document]:
     return chunks
 
 
+
 def chunk_generic(docs: Iterable[Document]) -> list[Document]:
     """Fallback for non-QA docs (.txt/.md/generic): fixed-size with overlap."""
     splitter = RecursiveCharacterTextSplitter(
@@ -162,6 +163,7 @@ def chunk_documents(docs: Iterable[Document]) -> list[Document]:
     # would cut answers in half.
     full_text = " ".join(d.page_content for d in docs)
 
+    # try to chunk as a Point/Q&A doc first. if no, then make a general chunking
     qa_chunks = chunk_qa_document(full_text, source)
     if qa_chunks:
         return qa_chunks

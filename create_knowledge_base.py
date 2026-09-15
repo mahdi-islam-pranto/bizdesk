@@ -15,7 +15,8 @@ all_docs = []
 for path in files:
     all_docs.extend(load_file(path))
 
-# chunk all the documents and add them to the vectorstore
+# chunk all the documents 
 chunks = chunk_documents(all_docs)
+# add all the chunks to the pinecone vector store
 ids = add_documents(chunks)
 print(f"Indexed {len(files)} files -> {len(chunks)} chunks -> {len(ids)} Pinecone vectors")
