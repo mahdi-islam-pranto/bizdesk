@@ -41,3 +41,6 @@ print(f"Found {len(relevant_docs)} relevant documents")
 print("ALL documents: ")
 for i, doc in enumerate(relevant_docs):
     print(f"Document {i+1}: {doc.page_content[:100]}...")
+
+
+# test the full workflow
