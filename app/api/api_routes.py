@@ -5,7 +5,7 @@ from app.core.config import get_settings
 from app.rag.workflow import ask
 from app.rag.vector_store import add_documents
 from app.services.ingestion import load_file, chunk_documents, SUPPORTED
-from app.services.store_conversations import add_conversation_audit
+from app.services.store_conversations import add_conversation_audit, get_token_usage_totals
 
 router = APIRouter(prefix="/api")
 
@@ -20,14 +20,33 @@ class ChatRequest(BaseModel):
 def health():
     return {"status": "ok", "service": settings.app_name}
 
+
+# cumulative token usage across all stored conversations
+@router.get("/token_usage")
+def token_usage_totals():
+    return get_token_usage_totals()
+
 # chat router
 @router.post("/chat")
 def chat(payload: ChatRequest):
     try:
         # execute full workflow
         result = ask(payload.question)
-        # store conversation to db
-        add_conversation_audit(payload.question, result["source_used"], result.get("trace", []))
+
+        input_tokens = result.get("input_tokens", 0)
+        output_tokens = result.get("output_tokens", 0)
+        token_usage = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "llm_calls": result.get("llm_calls", 0),
+            "by_node": result.get("token_usage_by_node", []),
+        }
+
+        # store conversation with its token usage to db
+        add_conversation_audit(
+            payload.question, result["source_used"], result.get("trace", []), token_usage
+        )
 
         return {
             "answer": result["answer"],
@@ -35,7 +54,7 @@ def chat(payload: ChatRequest):
             "trace": result.get("trace", []),
             "citations": result.get("citations", []),
             "rewritten_query": result.get("current_query", payload.question),
-
+            "token_usage": token_usage,
         }
 
     except Exception as exc:

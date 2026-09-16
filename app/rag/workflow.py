@@ -50,17 +50,50 @@ def add_trace(state: AgentState, message: str):
     return [*state.get("trace", []), message]
 
 
+# build the token usage state update for a single llm response
+def token_usage(node: str, response) -> dict:
+    meta = getattr(response, "usage_metadata", None) or {}
+    input_tokens = int(meta.get("input_tokens") or 0)
+    output_tokens = int(meta.get("output_tokens") or 0)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "llm_calls": 1,
+        "token_usage_by_node": [
+            {"node": node, "input_tokens": input_tokens, "output_tokens": output_tokens}
+        ],
+    }
+
+
+# plain llm call, returns the response message plus its token usage update
+def invoke_llm(node: str, prompt: str):
+    response = llm().invoke(prompt)
+    return response, token_usage(node, response)
+
+
+# structured llm call, keeps the raw message so token usage stays available
+def invoke_structured_llm(node: str, schema, prompt: str):
+    response = llm().with_structured_output(schema, method="json_mode", include_raw=True).invoke(prompt)
+    parsed = response.get("parsed")
+    if parsed is None:
+        raise RuntimeError(f"{node}: structured output failed → {response.get('parsing_error')}")
+    return parsed, token_usage(node, response.get("raw"))
+
+
 # route the question to: kb or direct answer and retrun the route in source_used and update the trace 
 def route_question(state: AgentState):
-    router = llm().with_structured_output(RouteDecision, method="json_mode")
-    decision = router.invoke(f"""
+    decision, usage = invoke_structured_llm("route_question", RouteDecision, f"""
 You route messages for an enterprise company customer support assistant.
 Use kb for company related questions and support.
 Use direct only for greetings, thanks, or casual chat that needs no company knowledge.
 Question: {state['question']}
 Return valid JSON like {{"route":"kb"}}.
 """)
-    return {"source_used": decision.route, "trace": add_trace(state, f"Router → {decision.route.upper()}")}
+    return {
+        "source_used": decision.route,
+        "trace": add_trace(state, f"Router → {decision.route.upper()}"),
+        **usage,
+    }
 
 
 # route the node based on the source_used in the state
@@ -76,16 +109,19 @@ def retrieve_kb(state: AgentState):
 
 # grade documents/chunks are good or weak for answering the question 
 def grade_kb(state: AgentState):
-    grader = llm().with_structured_output(EvidenceGrade, method="json_mode")
     context = "\n\n".join(f"Source: {d.metadata.get('source','unknown')}\n{d.page_content}" for d in state["kb_docs"])
-    grade = grader.invoke(f"""
+    grade, usage = invoke_structured_llm("grade_kb", EvidenceGrade, f"""
 You grade evidence for an enterprise customer support assistant.
 Question: {state['question']}
 Private company knowledge base evidence:\n{context}
 Return good only if the evidence is sufficient to answer confidently and specifically.
 Otherwise return weak. JSON: {{"grade":"good"}} or {{"grade":"weak"}}.
 """)
-    return {"kb_grade": grade.grade, "trace": add_trace(state, f"KB evidence grade → {grade.grade.upper()}")}
+    return {
+        "kb_grade": grade.grade,
+        "trace": add_trace(state, f"KB evidence grade → {grade.grade.upper()}"),
+        **usage,
+    }
 
 
 
@@ -96,7 +132,7 @@ def after_kb(state: AgentState) -> Literal["generate_from_kb", "search_web"]:
 
 # web search result based on the user query
 def search_web(state: AgentState):
-    result = web_search_tool().invoke({"query": state["current_query"]})
+    result = web_search_tool().invoke({"query": f"for daraz, {state["current_query"]}"})
     lines, citations = [], []
     if isinstance(result, dict):
         if result.get("answer"):
@@ -117,14 +153,18 @@ def search_web(state: AgentState):
 
 # grade web good or weak 
 def grade_web(state: AgentState):
-    grader = llm().with_structured_output(EvidenceGrade, method="json_mode")
-    grade = grader.invoke(f"""
+    grade, usage = invoke_structured_llm("grade_web", EvidenceGrade, f"""
 Question: {state['question']}
 Web evidence:\n{state['web_results']}
 Return good if the evidence is sufficient and directly relevant; otherwise weak.
 Return valid JSON like {{"grade":"good"}}.
 """)
-    return {"web_grade": grade.grade, "trace": add_trace(state, f"Web evidence grade → {grade.grade.upper()}")}
+
+    return {
+        "web_grade": grade.grade,
+        "trace": add_trace(state, f"Web evidence grade → {grade.grade.upper()}"),
+        **usage,
+    }
 
 
 # routing the the node based on grade web
@@ -139,27 +179,30 @@ def after_web(state: AgentState) -> Literal["generate_from_web", "rewrite_query"
 
 # rewrite the query or question for beter retriever or web search
 def rewrite_query(state: AgentState):
-    rewritten = llm().invoke(f"""
+    response, usage = invoke_llm("rewrite_query", f"""
 Rewrite this customer-support question for better private knowledge base retrieval and public web search.
 Preserve intent, add useful support keywords, do not answer, return only the query.
 Question: {state['question']}
-""").content.strip()
+""")
+    rewritten = response.content.strip()
     return {
         "current_query": rewritten,
         "retry_count": state["retry_count"] + 1,
         "trace": add_trace(state, f"Query rewrite → {rewritten}"),
+        **usage,
     }
 
 
 # generate answer with llm from knowledge base
 def generate_from_kb(state: AgentState):
     context = "\n\n".join(f"[Source: {d.metadata.get('source','unknown')}]\n{d.page_content}" for d in state["kb_docs"])
-    answer = llm().invoke(f"""
+    response, usage = invoke_llm("generate_from_kb", f"""
 You are an enterprise HR policy and employee support copilot. Answer ONLY from the private company HR KB below.
 Be concise, practical, respectful, and policy-grounded. If steps are present, present them clearly.
 Do not invent policy details. Mention that the answer is based on the company's private knowledge base.
 Question: {state['question']}\n\nPrivate KB:\n{context}
-""").content
+""")
+    answer = response.content
     citations = []
     seen = set()
     for d in state["kb_docs"]:
@@ -167,26 +210,42 @@ Question: {state['question']}\n\nPrivate KB:\n{context}
         if src not in seen:
             seen.add(src)
             citations.append({"title": src.split("/")[-1], "url": "", "type": "private_kb"})
-    return {"answer": answer, "source_used": "private_kb", "citations": citations, "trace": add_trace(state, "Answer generation → PRIVATE KB")}
+    return {
+        "answer": answer,
+        "source_used": "private_kb",
+        "citations": citations,
+        "trace": add_trace(state, "Answer generation → PRIVATE KB"),
+        **usage,
+    }
 
 
 # generate answer with llm based on web search results and question
 def generate_from_web(state: AgentState):
-    answer = llm().invoke(f"""
+    response, usage = invoke_llm("generate_from_web", f"""
 You are an enterprise customer support copilot. The private company Knowledge base was insufficient.
 Answer ONLY from the web evidence below. Clearly say this is external public information which you have answered.
 Question: {state['question']}\n\nWeb evidence:\n{state['web_results']}
-""").content
-    return {"answer": answer, "source_used": "web_search", "trace": add_trace(state, "Answer generation → WEB SEARCH")}
+""")
+    return {
+        "answer": response.content,
+        "source_used": "web_search",
+        "trace": add_trace(state, "Answer generation → WEB SEARCH"),
+        **usage,
+    }
 
 
 # generate answer for normal conversations
 def direct_answer(state: AgentState):
-    answer = llm().invoke(f"Respond briefly and naturally to: {state['question']}").content
-    return {"answer": answer, "source_used": "direct", "trace": add_trace(state, "Direct response → no retrieval")}
+    response, usage = invoke_llm("direct_answer", f"Respond briefly and naturally to: {state['question']}")
+    return {
+        "answer": response.content,
+        "source_used": "direct",
+        "trace": add_trace(state, "Direct response → no retrieval"),
+        **usage,
+    }
 
 
-# 
+# if no answer can be found from all the sources
 def insufficient(state: AgentState):
     return {
         "answer": "I couldn't find enough reliable evidence in the company knowledge base or external search to answer confidently. Please contact the support team or provide more details.",
@@ -253,5 +312,19 @@ def ask(question: str):
         "retry_count": 0,
         "trace": [],
         "citations": [],
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "llm_calls": 0,
+        "token_usage_by_node": [],
     }
-    return agent_graph.invoke(initial)
+    result = agent_graph.invoke(initial)
+
+    
+    total_in = result.get("input_tokens", 0)
+    total_out = result.get("output_tokens", 0)
+    result["trace"] = [
+        *result.get("trace", []),
+        f"Token usage → {result.get('llm_calls', 0)} LLM calls, "
+        f"input {total_in}, output {total_out}, total {total_in + total_out}",
+    ]
+    return result

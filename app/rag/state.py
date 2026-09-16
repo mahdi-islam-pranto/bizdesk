@@ -1,4 +1,5 @@
-from typing import List, Literal
+import operator
+from typing import Annotated, List, Literal
 from typing_extensions import TypedDict
 from pydantic import BaseModel, Field
 from langchain_core.documents import Document
@@ -23,3 +24,8 @@ class AgentState(TypedDict):
     retry_count: int
     trace: List[str]
     citations: List[dict]
+    # token usage accumulated across every llm call in the graph
+    input_tokens: Annotated[int, operator.add]
+    output_tokens: Annotated[int, operator.add]
+    llm_calls: Annotated[int, operator.add]
+    token_usage_by_node: Annotated[List[dict], operator.add]
